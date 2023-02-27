@@ -1,0 +1,213 @@
+# パッケージのimport
+import os.path as osp
+import random
+# XMLをファイルやテキストから読み込んだり、加工したり、保存したりするためのライブラリ
+import xml.etree.ElementTree as ET
+
+import cv2
+# pip install opencv-python
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.utils.data as data
+
+%matplotlib inline
+
+torch.manual_seed(1234)
+np.random.seed(1234)
+random.seed(1234)
+
+def make_datapath_list(rootpath):
+    """
+    학습 및 검증용 이미지 데이터와 어노테이션 데이터의 파일 경로 리스트 작성
+    
+    Parameters
+    ----------
+    rootpath : str
+        데이터 폴더 경로
+    
+    Returns
+    -------
+    ret : train_img_list, train_anno_list, val_img_list, val_anno_list
+        데이터 경로를 지정한 리스트
+    """
+    
+    # 이미지 파일과 어노테이션 파일의 경로 템플릿 작성
+    imgpath_template = osp.join(rootpath, "JPEGImages", "%s.jpg")
+    annopath_template = osp.join(rootpath, "SegmentationClass", "%s.xml")
+    
+    # 훈련 및 검증 파일 각각의 ID(파일 이름) 취득
+    train_id_names = osp.join(rootpath + "ImageSets/Segmentation/train.txt")
+    val_id_names = osp.join(rootpath + "ImageSets/Segmentation/val.txt")
+    
+    # 훈련 데이터의 이미지 파일과 어노테이션 파일의 경로 리스트 작성
+    train_img_list = []
+    train_anno_list = []
+    
+    for line in open(train_id_names):
+        file_id = line.strip() # 공백 제거
+        img_path = (imgpath_template % file_id) # 이미지 파일 경로
+        anno_path = (annopath_template % file_id) # 어노테이션 파일 경로
+        train_img_list.append(img_path)
+        train_anno_list.append(anno_path)
+        
+    # 검증 데이터의 이미지 파일과 어노테이션 파일의 경로 리스트 작성
+    val_img_list = []
+    val_anno_list = []
+    
+    for line in open(val_id_names):
+        file_id = line.strip() # 공백 제거
+        img_path = (imgpath_template % file_id) # 이미지 파일 경로
+        annot_path  = (annopath_template % file_id) # 어노테이션 파일 경로
+        val_img_list.append(img_path)
+        val_anno_list.append(annot_path)
+        
+    return train_img_list, train_anno_list, val_img_list, val_anno_list
+    
+    
+
+# 동작 확인 : 파일 경로 리스트 취득
+rootpath = "./data/VOCdevkit/VOC2012/"
+
+train_img_list, train_anno_list, val_img_list, val_anno_list = make_datapath_list(rootpath)
+
+print(train_img_list[0])
+print(train_anno_list[0])
+
+
+# 데이터 처리 클래스와 데이터 확장 클래스 import
+from utils.data_augumentation import Compose, Scale, RandomRotation, RandomMirror, Resize, Normalize_Tensor
+
+class DataTransform():
+    """
+    이미지와 어노테이션의 전처리 클래스. 훈련 시와 검증 시 다르게 동작한다.
+    이미지 크기를 input size x input_size로 한다.
+    훈련 시 데이터 확장을 수행한다. (Augumentation)
+    
+    Attributes
+    ----------
+    
+    input_size : int
+        리사이즈 대상의 이미지 크기
+    color_mean : (R, G, B)
+        각 채널의 평균 값
+    color_std : (R, G, B)
+        각 채널의 표준 편차
+    """
+    
+    def __init__(self, input_size, color_mean, color_std) -> None:
+        self.data_transform = {
+            "train" : Compose([
+                Scale(sclae = [0.5, 1.5]), # 이미지 확대
+                RandomRotation(angle=[-10, 10]), # 이미지 회전
+                RandomMirror(), # 이미지 좌우 반전
+                Resize(input_size), # 이미지 크기 조정
+                Normalize_Tensor(color_mean, color_std) # 색상 정보의 표준화와 텐서화
+            ]),
+            "val" : Compose([
+                Resize(input_size), # 이미지 크기 조정
+                Normalize_Tensor(color_mean, color_std) # 새상 정보의 표준화와 텐서화
+            ])
+        }
+    
+    def __call__(self, phase, img, anno_class_img):
+        """
+        Parameters
+        
+        phase : 'train' or 'val'
+            전처리 모드 지정
+        """
+        return self.data_transform[phase](img, anno_class_img)
+        
+
+class VOCDataset(data.Dataset):
+    """
+    VOC2012의 Dataset을 만드는 클래스, 파이토치의 Dataset 클래스 상속
+    
+    Attributes
+    ----------
+    img_list : 리스트
+        이미지 경로를 저장한 리스트
+    anno_list : 리스트
+        어노테이션 경로를 저장한 리스트
+    phase : 'train' or 'test'
+        학습 또는 테스트 모드 지정
+    transform : object
+        전처리 클래스 인스턴스
+    """
+    
+    def __init__(self, img_list, anno_list, phase, transform) -> None:
+        self.img_list = img_list
+        self.anno_list = anno_list
+        self.phase = phase
+        self.transform = transform
+        
+    def __len__(self):
+        """
+        이미지의 개수 반환
+        """
+        return len(self.img_list)
+    
+    def __getitem__(self, index: int):
+        """
+        전처리한 이미지의 텐서 형식 데이터와 어노테이션 획득
+        """
+        img, anno_class_img = self.pull_item(index)
+        return img, anno_class_img
+    
+    def pull_item(self, index):
+        """
+        이미지의 텐서 형식 데이터와 어노테이션 획득
+        """
+        # 1. 이미지 읽기
+        image_file_path = self.img_list[index]
+        img = Image.open(image_file_path)
+        
+        # 2. 어노테이션 이미지 읽기
+        anno_file_path = self.anno_list[index]
+        anno_class_img = Image.open(anno_file_path) # [높이][폭]
+        
+        # 3. 전처리 시시
+        img, anno_class_img = self.transform(self.phase, img, anno_class_img)
+        
+        return img, anno_class_img
+
+# 동작 확인
+
+# (RGB) 색의 평균치와 표준편차
+color_mean = (0.485, 0.456, 0.406)
+color_std = (0.229, 0.224, 0.225)
+
+# 데이터셋 작성
+train_dataset = VOCDataset(train_img_list, train_anno_list, phase="train", transform=DataTransform(input_size=475, color_mean=color_mean, color_std=color_std))
+val_dataset = VOCDataset(val_img_list, val_anno_list, phase="val", transform=DataTransform(input_size=475, color_mean=color_mean, color_std=color_std))
+
+# 데이터 추출 예시
+print(val_dataset.__getitem__(0)[0].shape)
+print(val_dataset.__getitem__(0)[1].shape)
+print(val_dataset.__getitem__(0))
+
+# 데이터 로더 작성
+
+# "어노테이션 크기가 변하지 않으면" 그냥 pytorch의 DataLoader클래스 사용하면 됨!!
+batch_size = 8
+
+train_dataloader = data.DataLoader(
+    train_dataset, batch_size=batch_size, shuffle=True
+)
+val_dataloader = data.DataLoader(
+    val_dataset, batch_size=batch_size, shuffle=False
+)
+
+# 사전 오브젝트로 정리
+dataloaders_dict = {
+    "train" : train_dataloader,
+    "val" : val_dataloader
+}
+
+# 동작 확인
+batch_iterator = iter(dataloaders_dict["val"]) # iterator로 변환
+imgs, anno_class_imgs = next(batch_iterator) # 첫 번째 요소를 꺼낸다.
+print(imgs.size())
+print(anno_class_imgs.size())
+
